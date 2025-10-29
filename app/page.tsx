@@ -46,12 +46,6 @@ interface ParsedTask {
   fallback?: boolean;
 }
 
-interface DailySummaryRecord {
-  text: string;
-  count: number;
-  generatedAt: string;
-}
-
 type RemovalReason = "complete" | "delete" | "expired";
 
 interface RemovalInfo {
@@ -80,10 +74,6 @@ function getCompletedKey(dateKey: string) {
 
 function getExpiredCountKey(dateKey: string) {
   return `sd:expiredCount:${dateKey}`;
-}
-
-function getSummaryKey(dateKey: string) {
-  return `sd:summary:${dateKey}`;
 }
 
 function getArchiveKey(dateKey: string) {
@@ -166,8 +156,8 @@ export default function HomePage() {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
-  const [dailySummary, setDailySummary] = useState<DailySummaryRecord | null>(null);
-  const [showSummary, setShowSummary] = useState(false);
+  const [completionMessage, setCompletionMessage] = useState<string | null>(null);
+  const [completionTaskTitle, setCompletionTaskTitle] = useState<string | null>(null);
 
   const [hydrated, setHydrated] = useState(false);
   const [pendingRemoval, setPendingRemoval] = useState<Map<string, RemovalInfo>>(new Map());
@@ -176,6 +166,7 @@ export default function HomePage() {
   const pendingRemovalRef = useRef<Map<string, RemovalInfo>>(new Map());
   const removalTimersRef = useRef<Map<string, number>>(new Map());
   const previousLengthRef = useRef(0);
+  const messageTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (typeof window === "undefined") {
@@ -220,8 +211,6 @@ export default function HomePage() {
     const completedKey = getCompletedKey(dateKey);
     const expiredCountKey = getExpiredCountKey(dateKey);
     const archiveKey = getArchiveKey(dateKey);
-    const summaryKey = getSummaryKey(dateKey);
-
     const completed =
       safeParseJson<CompletedTask[]>(localStorage.getItem(completedKey)) ?? [];
     setCompletedToday(
@@ -234,34 +223,6 @@ export default function HomePage() {
     const archiveForDay = safeParseJson<ArchiveEntry>(localStorage.getItem(archiveKey));
     if (archiveForDay) {
       setLastArchive(archiveForDay);
-    }
-
-    const summaryRaw = localStorage.getItem(summaryKey);
-    if (summaryRaw) {
-      try {
-        const parsed = JSON.parse(summaryRaw) as DailySummaryRecord;
-        if (parsed?.text) {
-          setDailySummary(parsed);
-        } else {
-          const record: DailySummaryRecord = {
-            text: summaryRaw,
-            count: completed.length,
-            generatedAt: new Date().toISOString(),
-          };
-          setDailySummary(record);
-          localStorage.setItem(summaryKey, JSON.stringify(record));
-        }
-      } catch {
-        const record: DailySummaryRecord = {
-          text: summaryRaw,
-          count: completed.length,
-          generatedAt: new Date().toISOString(),
-        };
-        setDailySummary(record);
-        localStorage.setItem(summaryKey, JSON.stringify(record));
-      }
-    } else {
-      setDailySummary(null);
     }
   }, [dateKey, hydrated]);
 
@@ -334,6 +295,53 @@ export default function HomePage() {
     return () => window.clearInterval(id);
   }, [dateKey]);
 
+  const generateCompletionMessage = useCallback(
+    (task: CompletedTask) => {
+      if (typeof window === "undefined") {
+        return;
+      }
+
+      setCompletionTaskTitle(task.title);
+
+      const body = {
+        completed: [
+          {
+            title: task.title,
+            durationMins: task.durationMins,
+          },
+        ],
+        dateISO: new Date().toISOString(),
+      };
+
+      void fetch("/api/ai/completion-message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      })
+        .then(async (res) => {
+          if (!res.ok) {
+            throw new Error("Request failed");
+          }
+          const data = (await res.json()) as { summary?: string };
+          const text = data.summary?.trim() || `Nice work finishing ${task.title}!`;
+          setCompletionMessage(text);
+        })
+        .catch(() => {
+          setCompletionMessage(`Nice work finishing ${task.title}!`);
+        })
+        .finally(() => {
+          if (messageTimerRef.current) {
+            window.clearTimeout(messageTimerRef.current);
+          }
+          messageTimerRef.current = window.setTimeout(() => {
+            setCompletionMessage(null);
+            setCompletionTaskTitle(null);
+          }, 6000);
+        });
+    },
+    []
+  );
+
   const finalizeRemoval = useCallback(
     (taskId: string) => {
       const info = pendingRemovalRef.current.get(taskId);
@@ -361,6 +369,8 @@ export default function HomePage() {
           }
           return [...prev, completedTask];
         });
+
+        generateCompletionMessage(completedTask);
       }
 
       if (info.reason === "expired") {
@@ -426,6 +436,9 @@ export default function HomePage() {
         window.clearTimeout(timeoutId);
       });
       removalTimersRef.current.clear();
+      if (messageTimerRef.current) {
+        window.clearTimeout(messageTimerRef.current);
+      }
     };
   }, []);
 
@@ -476,50 +489,10 @@ export default function HomePage() {
 
       setLastArchive(archiveEntry);
 
-      const summaryKey = getSummaryKey(dateKey);
-      const needsNewSummary =
-        tasksDone > 0 &&
-        (!dailySummary || dailySummary.count !== tasksDone);
-
-      if (needsNewSummary) {
-        void fetch("/api/ai/daily-summary", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            completed: completedToday.map((task) => ({
-              title: task.title,
-              durationMins: task.durationMins,
-            })),
-            dateISO: new Date().toISOString(),
-          }),
-        })
-          .then(async (res) => {
-            if (!res.ok) {
-              throw new Error("Request failed");
-            }
-            const data = (await res.json()) as { summary?: string };
-            if (data.summary) {
-              const record: DailySummaryRecord = {
-                text: data.summary,
-                count: tasksDone,
-                generatedAt: new Date().toISOString(),
-              };
-              setDailySummary(record);
-              if (typeof window !== "undefined") {
-                localStorage.setItem(summaryKey, JSON.stringify(record));
-              }
-              setShowSummary(true);
-            }
-          })
-          .catch(() => {
-            // Silent fail, do not block UX.
-          });
-      } else if (dailySummary) {
-        setShowSummary(true);
-      }
+      // Completion messages are handled per task.
     }
     previousLengthRef.current = tasks.length;
-  }, [tasks.length, completedToday, expiredCountToday, dateKey, dailySummary]);
+  }, [tasks.length, completedToday, expiredCountToday, dateKey]);
 
   const handleManualSubmit = useCallback(
     (event: React.FormEvent) => {
@@ -682,14 +655,14 @@ export default function HomePage() {
     setLastArchive(null);
   }, [addTask, lastArchive]);
 
-  const handleCopySummary = useCallback(() => {
-    if (!dailySummary) {
-      return;
+  const handleDismissMessage = useCallback(() => {
+    if (messageTimerRef.current) {
+      window.clearTimeout(messageTimerRef.current);
+      messageTimerRef.current = null;
     }
-    if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(dailySummary.text);
-    }
-  }, [dailySummary]);
+    setCompletionMessage(null);
+    setCompletionTaskTitle(null);
+  }, []);
 
   return (
     <main className="min-h-screen py-14 px-4 sm:px-6 flex items-center justify-center">
@@ -967,20 +940,19 @@ export default function HomePage() {
         </section>
       </section>
 
-      {dailySummary && showSummary && (
-        <div className="fixed bottom-6 left-1/2 z-40 w-[min(90%,20rem)] -translate-x-1/2 rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-xl">
-          <p className="text-sm font-medium text-midnight-800">{dailySummary.text}</p>
+      {completionMessage && (
+        <div className="fixed bottom-6 left-1/2 z-40 w-[min(90%,22rem)] -translate-x-1/2 rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-xl">
+          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-indigo-400">
+            Task cleared
+          </p>
+          <p className="mt-1 text-sm font-medium text-midnight-800">{completionMessage}</p>
+          {completionTaskTitle && (
+            <p className="mt-1 text-xs text-midnight-500">Task: {completionTaskTitle}</p>
+          )}
           <div className="mt-3 flex items-center justify-end gap-2">
             <button
               type="button"
-              onClick={handleCopySummary}
-              className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-midnight-600 transition hover:border-indigo-300 hover:text-indigo-600"
-            >
-              Copy
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowSummary(false)}
+              onClick={handleDismissMessage}
               className="rounded-full bg-midnight-900 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-midnight-800"
             >
               Dismiss
