@@ -46,6 +46,12 @@ interface ParsedTask {
   fallback?: boolean;
 }
 
+interface DailySummaryRecord {
+  text: string;
+  count: number;
+  generatedAt: string;
+}
+
 type RemovalReason = "complete" | "delete" | "expired";
 
 interface RemovalInfo {
@@ -160,7 +166,7 @@ export default function HomePage() {
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
 
-  const [dailySummary, setDailySummary] = useState<string | null>(null);
+  const [dailySummary, setDailySummary] = useState<DailySummaryRecord | null>(null);
   const [showSummary, setShowSummary] = useState(false);
 
   const [hydrated, setHydrated] = useState(false);
@@ -230,9 +236,30 @@ export default function HomePage() {
       setLastArchive(archiveForDay);
     }
 
-    const summary = localStorage.getItem(summaryKey);
-    if (summary) {
-      setDailySummary(summary);
+    const summaryRaw = localStorage.getItem(summaryKey);
+    if (summaryRaw) {
+      try {
+        const parsed = JSON.parse(summaryRaw) as DailySummaryRecord;
+        if (parsed?.text) {
+          setDailySummary(parsed);
+        } else {
+          const record: DailySummaryRecord = {
+            text: summaryRaw,
+            count: completed.length,
+            generatedAt: new Date().toISOString(),
+          };
+          setDailySummary(record);
+          localStorage.setItem(summaryKey, JSON.stringify(record));
+        }
+      } catch {
+        const record: DailySummaryRecord = {
+          text: summaryRaw,
+          count: completed.length,
+          generatedAt: new Date().toISOString(),
+        };
+        setDailySummary(record);
+        localStorage.setItem(summaryKey, JSON.stringify(record));
+      }
     } else {
       setDailySummary(null);
     }
@@ -449,7 +476,12 @@ export default function HomePage() {
 
       setLastArchive(archiveEntry);
 
-      if (tasksDone > 0 && !dailySummary) {
+      const summaryKey = getSummaryKey(dateKey);
+      const needsNewSummary =
+        tasksDone > 0 &&
+        (!dailySummary || dailySummary.count !== tasksDone);
+
+      if (needsNewSummary) {
         void fetch("/api/ai/daily-summary", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -467,9 +499,14 @@ export default function HomePage() {
             }
             const data = (await res.json()) as { summary?: string };
             if (data.summary) {
-              setDailySummary(data.summary);
+              const record: DailySummaryRecord = {
+                text: data.summary,
+                count: tasksDone,
+                generatedAt: new Date().toISOString(),
+              };
+              setDailySummary(record);
               if (typeof window !== "undefined") {
-                localStorage.setItem(getSummaryKey(dateKey), data.summary);
+                localStorage.setItem(summaryKey, JSON.stringify(record));
               }
               setShowSummary(true);
             }
@@ -650,7 +687,7 @@ export default function HomePage() {
       return;
     }
     if (typeof navigator !== "undefined" && navigator.clipboard) {
-      void navigator.clipboard.writeText(dailySummary);
+      void navigator.clipboard.writeText(dailySummary.text);
     }
   }, [dailySummary]);
 
@@ -932,7 +969,7 @@ export default function HomePage() {
 
       {dailySummary && showSummary && (
         <div className="fixed bottom-6 left-1/2 z-40 w-[min(90%,20rem)] -translate-x-1/2 rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-xl">
-          <p className="text-sm font-medium text-midnight-800">{dailySummary}</p>
+          <p className="text-sm font-medium text-midnight-800">{dailySummary.text}</p>
           <div className="mt-3 flex items-center justify-end gap-2">
             <button
               type="button"
