@@ -575,7 +575,11 @@ export default function HomePage() {
         const response = await fetch("/api/ai/parse-task", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: trimmed }),
+          body: JSON.stringify({
+            text: trimmed,
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            nowISO: new Date().toISOString(),
+          }),
         });
 
         if (!response.ok) {

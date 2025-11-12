@@ -6,6 +6,12 @@ type ParsedTask = {
   priority: "low" | "medium" | "high";
 };
 
+type ParseRequestBody = {
+  text?: string;
+  timezone?: string;
+  nowISO?: string;
+};
+
 const MODEL = "gpt-4o-mini";
 const FALLBACK_MODEL = "gpt-4o";
 
@@ -19,7 +25,7 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  let body: { text?: string };
+  let body: ParseRequestBody;
   try {
     body = await request.json();
   } catch {
@@ -32,6 +38,21 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Text is required." }, { status: 400 });
   }
 
+  const timezone =
+    typeof body.timezone === "string" && body.timezone.length > 0 ? body.timezone : "UTC";
+  const nowISO =
+    typeof body.nowISO === "string" && !Number.isNaN(Date.parse(body.nowISO))
+      ? body.nowISO
+      : new Date().toISOString();
+
+  const userPrompt = [
+    `Task description: ${text}`,
+    `User timezone: ${timezone}`,
+    `Current local time: ${nowISO}`,
+    "If the user mentions a specific time or part of day, interpret it in the provided timezone.",
+    "If no explicit date is given, assume the soonest future occurrence that matches the description.",
+  ].join("\n");
+
   const payload = {
     model: MODEL,
     messages: [
@@ -42,7 +63,7 @@ export async function POST(request: NextRequest) {
       },
       {
         role: "user",
-        content: text,
+        content: userPrompt,
       },
     ],
     temperature: 0.2,
