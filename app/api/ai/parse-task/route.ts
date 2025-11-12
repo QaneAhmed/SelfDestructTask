@@ -6,10 +6,16 @@ type ParsedTask = {
   priority: "low" | "medium" | "high";
 };
 
+type TimeHint = {
+  hour: number;
+  minute: number;
+};
+
 type ParseRequestBody = {
   text?: string;
   timezone?: string;
   nowISO?: string;
+  timeHint?: TimeHint | null;
 };
 
 const MODEL = "gpt-4o-mini";
@@ -45,13 +51,25 @@ export async function POST(request: NextRequest) {
       ? body.nowISO
       : new Date().toISOString();
 
+  const timeHintLine =
+    body.timeHint && Number.isFinite(body.timeHint.hour)
+      ? `User supplied explicit 24h time hint: ${body.timeHint.hour
+          .toString()
+          .padStart(2, "0")}:${body.timeHint.minute?.toString().padStart(2, "0") || "00"}.`
+      : null;
+
   const userPrompt = [
     `Task description: ${text}`,
     `User timezone: ${timezone}`,
     `Current local time: ${nowISO}`,
+    "Interpret bare numbers immediately following the task text as 24-hour times (e.g., '14' → 14:00, '21' → 21:00) unless the user explicitly mentions am/pm.",
+    "Do NOT infer a different calendar date unless the user clearly states one; otherwise keep the due date on the user's current day unless that time has already passed.",
+    "When the user only specifies an hour, default minutes to 00.",
     "If the user mentions a specific time or part of day, interpret it in the provided timezone.",
-    "If no explicit date is given, assume the soonest future occurrence that matches the description.",
-  ].join("\n");
+    "If no explicit time is given, fall back to default behavior.",
+  ]
+    .concat(timeHintLine ? [timeHintLine] : [])
+    .join("\n");
 
   const payload = {
     model: MODEL,

@@ -8,3 +8,40 @@ body {
     radial-gradient(circle at 50% 120%, rgba(14, 165, 233, 0.15), transparent 45%),
     #f8fafc;
 }
+
+@keyframes priorityBounce {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+  }
+  85% {
+    transform: translateY(-2px);
+  }
+  90% {
+    transform: translateY(0);
+  }
+  95% {
+    transform: translateY(-1px);
+  }
+}
+
+.priority-chip {
+  animation: priorityBounce 2.4s ease-in-out infinite;
+  box-shadow: 0 8px 20px rgba(99, 102, 241, 0.2);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.priority-chip::after {
+  content: "▾";
+  font-size: 0.65rem;
+  margin-left: 0.35rem;
+  opacity: 0.8;
+}
+
+.priority-chip:hover,
+.priority-chip:focus-visible {
+  animation: none;
+  transform: translateY(-2px) scale(1.02);
+  box-shadow: 0 10px 24px rgba(99, 102, 241, 0.3);
+}

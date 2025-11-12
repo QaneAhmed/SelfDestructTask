@@ -31,14 +31,6 @@ interface CompletedTask {
   dueAt: string | null;
 }
 
-interface ArchiveEntry {
-  date: string;
-  tasksDone: number;
-  expiredCount: number;
-  avgTimeAliveMins: number;
-  tasks: CompletedTask[];
-}
-
 interface ParsedTask {
   title: string;
   due: string | null;
@@ -62,7 +54,25 @@ const REMOVAL_DELAY = 320; // ms
 
 const ACTIVE_TASKS_KEY = "sd:tasks";
 const EXPIRED_TASKS_KEY = "sd:expired";
-const LAST_ARCHIVE_KEY = "sd:lastArchive";
+
+const PRIORITY_WEIGHT: Record<TaskPriority, number> = {
+  high: 0,
+  medium: 1,
+  low: 2,
+};
+
+function dedupeTasks<T extends { id: string }>(tasks: T[]): T[] {
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const task of tasks) {
+    if (seen.has(task.id)) {
+      continue;
+    }
+    seen.add(task.id);
+    result.push(task);
+  }
+  return result;
+}
 
 function getDateKey(date = new Date()): string {
   return date.toISOString().split("T")[0]!;
@@ -74,10 +84,6 @@ function getCompletedKey(dateKey: string) {
 
 function getExpiredCountKey(dateKey: string) {
   return `sd:expiredCount:${dateKey}`;
-}
-
-function getArchiveKey(dateKey: string) {
-  return `sd:archive:${dateKey}`;
 }
 
 function safeParseJson<T>(value: string | null): T | null {
@@ -101,11 +107,11 @@ function formatTimeRemaining(ms: number): string {
   const minutes = Math.floor((totalSeconds % 3600) / 60);
   const seconds = totalSeconds % 60;
 
-  if (hours > 0) {
-    return `${hours}h ${minutes.toString().padStart(2, "0")}m`;
-  }
+  const HH = hours.toString().padStart(2, "0");
+  const MM = minutes.toString().padStart(2, "0");
+  const SS = seconds.toString().padStart(2, "0");
 
-  return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+  return `${HH}:${MM}:${SS}`;
 }
 
 function formatDueLabel(due: string | null): string | null {
@@ -119,9 +125,43 @@ function formatDueLabel(due: string | null): string | null {
   return new Intl.DateTimeFormat(undefined, {
     month: "short",
     day: "numeric",
-    hour: "numeric",
+    hour: "2-digit",
     minute: "2-digit",
+    hour12: false,
   }).format(dueDate);
+}
+
+function buildLocalDueISO(hour: number, minute = 0) {
+  const now = new Date();
+  const due = new Date(now);
+  due.setHours(hour, minute, 0, 0);
+  if (due.getTime() <= now.getTime()) {
+    due.setDate(due.getDate() + 1);
+  }
+  return due.toISOString();
+}
+
+function detectTimeHint(input: string) {
+  const match = input.match(/^(.*\S)?\s+(\d{1,2})(?::(\d{2}))?\s*$/);
+  if (!match) {
+    return null;
+  }
+  const base = (match[1] ?? "").trim();
+  const hour = Number(match[2]);
+  const minute = match[3] ? Number(match[3]) : 0;
+  if (!Number.isFinite(hour) || hour < 0 || hour > 23) {
+    return null;
+  }
+  if (!Number.isFinite(minute) || minute < 0 || minute > 59) {
+    return null;
+  }
+
+  return {
+    text: base.length > 0 ? base : input.trim(),
+    hour,
+    minute,
+    dueISO: buildLocalDueISO(hour, minute),
+  };
 }
 
 function generateId(): string {
@@ -142,7 +182,6 @@ export default function HomePage() {
   const [expiredTasks, setExpiredTasks] = useState<ExpiredTask[]>([]);
   const [completedToday, setCompletedToday] = useState<CompletedTask[]>([]);
   const [expiredCountToday, setExpiredCountToday] = useState(0);
-  const [lastArchive, setLastArchive] = useState<ArchiveEntry | null>(null);
   const [dateKey, setDateKey] = useState(getDateKey());
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [relativeNow, setRelativeNow] = useState(Date.now());
@@ -155,9 +194,11 @@ export default function HomePage() {
   const [aiResult, setAiResult] = useState<ParsedTask | null>(null);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiError, setAiError] = useState<string | null>(null);
+  const [aiPriority, setAiPriority] = useState<TaskPriority>("medium");
 
   const [completionMessage, setCompletionMessage] = useState<string | null>(null);
   const [completionTaskTitle, setCompletionTaskTitle] = useState<string | null>(null);
+  const [showExpiredRestore, setShowExpiredRestore] = useState(false);
 
   const [hydrated, setHydrated] = useState(false);
   const [pendingRemoval, setPendingRemoval] = useState<Map<string, RemovalInfo>>(new Map());
@@ -165,7 +206,6 @@ export default function HomePage() {
   const tasksRef = useRef<ActiveTask[]>([]);
   const pendingRemovalRef = useRef<Map<string, RemovalInfo>>(new Map());
   const removalTimersRef = useRef<Map<string, number>>(new Map());
-  const previousLengthRef = useRef(0);
   const messageTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -190,12 +230,8 @@ export default function HomePage() {
       const validExpired = storedExpired
         .filter((task) => typeof task.expiredAt === "string" && typeof task.title === "string")
         .sort((a, b) => Date.parse(b.expiredAt) - Date.parse(a.expiredAt));
-      setExpiredTasks(validExpired.slice(0, MAX_EXPIRED_STORED));
+      setExpiredTasks(dedupeTasks(validExpired).slice(0, MAX_EXPIRED_STORED));
 
-      const lastArchiveRaw = safeParseJson<ArchiveEntry>(localStorage.getItem(LAST_ARCHIVE_KEY));
-      if (lastArchiveRaw) {
-        setLastArchive(lastArchiveRaw);
-      }
     } catch (error) {
       console.error("Failed to load persisted data", error);
     } finally {
@@ -210,7 +246,6 @@ export default function HomePage() {
 
     const completedKey = getCompletedKey(dateKey);
     const expiredCountKey = getExpiredCountKey(dateKey);
-    const archiveKey = getArchiveKey(dateKey);
     const completed =
       safeParseJson<CompletedTask[]>(localStorage.getItem(completedKey)) ?? [];
     setCompletedToday(
@@ -219,11 +254,6 @@ export default function HomePage() {
 
     const expiredCount = Number(localStorage.getItem(expiredCountKey) ?? "0");
     setExpiredCountToday(Number.isFinite(expiredCount) ? expiredCount : 0);
-
-    const archiveForDay = safeParseJson<ArchiveEntry>(localStorage.getItem(archiveKey));
-    if (archiveForDay) {
-      setLastArchive(archiveForDay);
-    }
   }, [dateKey, hydrated]);
 
   useEffect(() => {
@@ -257,20 +287,6 @@ export default function HomePage() {
     localStorage.setItem(expiredCountKey, String(expiredCountToday));
   }, [expiredCountToday, hydrated, dateKey]);
 
-  useEffect(() => {
-    if (!hydrated || typeof window === "undefined") {
-      return;
-    }
-    const archiveKey = getArchiveKey(dateKey);
-    if (lastArchive?.date === dateKey) {
-      localStorage.setItem(archiveKey, JSON.stringify(lastArchive));
-    }
-    if (lastArchive) {
-      localStorage.setItem(LAST_ARCHIVE_KEY, JSON.stringify(lastArchive));
-    } else {
-      localStorage.removeItem(LAST_ARCHIVE_KEY);
-    }
-  }, [lastArchive, hydrated, dateKey]);
 
   useEffect(() => {
     const tick = () => setCurrentTime(Date.now());
@@ -294,6 +310,12 @@ export default function HomePage() {
     const id = window.setInterval(checkDate, 60 * 1000);
     return () => window.clearInterval(id);
   }, [dateKey]);
+
+  useEffect(() => {
+    if (expiredTasks.length === 0) {
+      setShowExpiredRestore(false);
+    }
+  }, [expiredTasks.length]);
 
   const generateCompletionMessage = useCallback(
     (task: CompletedTask) => {
@@ -380,7 +402,8 @@ export default function HomePage() {
         };
 
         setExpiredTasks((prev) => {
-          const next = [expiredTask, ...prev];
+          const withoutTask = prev.filter((item) => item.id !== expiredTask.id);
+          const next = [expiredTask, ...withoutTask];
           return next.slice(0, MAX_EXPIRED_STORED);
         });
 
@@ -420,6 +443,9 @@ export default function HomePage() {
       }
 
       pendingRemovalRef.current.set(task.id, info);
+      if (reason === "complete") {
+        void fireConfetti(task.priority);
+      }
       setPendingRemoval(new Map(pendingRemovalRef.current));
 
       const timeoutId = window.setTimeout(() => {
@@ -463,36 +489,6 @@ export default function HomePage() {
 
     return () => window.clearInterval(id);
   }, [startRemoval]);
-
-  useEffect(() => {
-    const prevLength = previousLengthRef.current;
-    if (prevLength > 0 && tasks.length === 0 && pendingRemovalRef.current.size === 0) {
-      window.setTimeout(() => {
-        void fireConfetti();
-      }, REMOVAL_DELAY);
-
-      const tasksDone = completedToday.length;
-      const avgTimeAliveMins =
-        tasksDone === 0
-          ? 0
-          : Math.round(
-              completedToday.reduce((sum, task) => sum + (task.durationMins ?? 0), 0) / tasksDone
-            );
-
-      const archiveEntry: ArchiveEntry = {
-        date: dateKey,
-        tasksDone,
-        expiredCount: expiredCountToday,
-        avgTimeAliveMins,
-        tasks: completedToday,
-      };
-
-      setLastArchive(archiveEntry);
-
-      // Completion messages are handled per task.
-    }
-    previousLengthRef.current = tasks.length;
-  }, [tasks.length, completedToday, expiredCountToday, dateKey]);
 
   const handleManualSubmit = useCallback(
     (event: React.FormEvent) => {
@@ -567,31 +563,62 @@ export default function HomePage() {
         return;
       }
 
+      const hint = detectTimeHint(trimmed);
+      const textForModel = hint?.text ?? trimmed;
+      const hintData = hint ? { hour: hint.hour, minute: hint.minute } : undefined;
+      const explicitTime =
+        Boolean(hint) ||
+        /\b\d{1,2}:\d{2}\b/.test(textForModel) ||
+        /\b\d{1,2}\s?(?:am|pm)\b/i.test(textForModel);
+
       setAiLoading(true);
       setAiError(null);
       setAiResult(null);
+
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), 8000);
 
       try {
         const response = await fetch("/api/ai/parse-task", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            text: trimmed,
+            text: textForModel,
             timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
             nowISO: new Date().toISOString(),
+            timeHint: hintData,
           }),
+          signal: controller.signal,
         });
 
         if (!response.ok) {
           throw new Error("Request failed");
         }
-
+        window.clearTimeout(timeoutId);
         const parsed = (await response.json()) as ParsedTask;
+        if (hint?.dueISO) {
+          parsed.due = hint.dueISO;
+        } else if (!explicitTime) {
+          parsed.due = null;
+        }
         setAiResult(parsed);
+        setAiPriority(parsed.priority);
       } catch (error) {
         console.error("AI parse failed", error);
-        setAiError("Could not parse task. Try again or add manually.");
+        if ((error as Error).name === "AbortError") {
+          const fallback: ParsedTask = {
+            title: textForModel.slice(0, 80) || "Untitled Task",
+            due: hint?.dueISO ?? null,
+            priority: "medium",
+          };
+          setAiResult(fallback);
+          setAiPriority("medium");
+          setAiError("Connection was slow, applied a quick parse.");
+        } else {
+          setAiError("Could not parse task. Try again or add manually.");
+        }
       } finally {
+        window.clearTimeout(timeoutId);
         setAiLoading(false);
       }
     },
@@ -605,10 +632,10 @@ export default function HomePage() {
 
     addTask({
       title: aiResult.title,
-      priority: aiResult.priority,
+      priority: aiPriority,
       dueAt: aiResult.due,
     });
-  }, [addTask, aiResult]);
+  }, [addTask, aiPriority, aiResult]);
 
   const visibleTasks = useMemo(
     () => tasks.filter((task) => !pendingRemovalRef.current.has(task.id)),
@@ -616,7 +643,14 @@ export default function HomePage() {
   );
 
   const sortedTasks = useMemo(
-    () => [...visibleTasks].sort((a, b) => a.expiresAt - b.expiresAt),
+    () =>
+      [...visibleTasks].sort((a, b) => {
+        const priorityDiff = PRIORITY_WEIGHT[a.priority] - PRIORITY_WEIGHT[b.priority];
+        if (priorityDiff !== 0) {
+          return priorityDiff;
+        }
+        return a.expiresAt - b.expiresAt;
+      }),
     [visibleTasks]
   );
 
@@ -643,21 +677,31 @@ export default function HomePage() {
     [removeTaskImmediately, startRemoval]
   );
 
-  const handleRestoreArchive = useCallback(() => {
-    if (!lastArchive || lastArchive.tasks.length === 0) {
-      return;
-    }
-
-    lastArchive.tasks.forEach((task) => {
-      addTask({
-        title: task.title,
-        priority: task.priority,
-        dueAt: task.dueAt,
+  const handleRestoreExpiredTask = useCallback(
+    (taskId: string) => {
+      setExpiredTasks((prev) => {
+        const task = prev.find((item) => item.id === taskId);
+        if (!task) {
+          return prev;
+        }
+        addTask({
+          title: task.title,
+          priority: task.priority,
+          dueAt: null,
+        });
+        return prev.filter((item) => item.id !== taskId);
       });
-    });
+    },
+    [addTask]
+  );
 
-    setLastArchive(null);
-  }, [addTask, lastArchive]);
+  const handleClearExpired = useCallback(() => {
+    setExpiredTasks([]);
+    setShowExpiredRestore(false);
+    if (typeof window !== "undefined") {
+      localStorage.removeItem(EXPIRED_TASKS_KEY);
+    }
+  }, []);
 
   const handleDismissMessage = useCallback(() => {
     if (messageTimerRef.current) {
@@ -694,17 +738,16 @@ export default function HomePage() {
           </div>
         </header>
 
-        {lastArchive?.date === dateKey && lastArchive.tasks.length > 0 && (
-          <div className="mb-8 rounded-2xl border border-slate-200 bg-slate-50 px-5 py-4 shadow-inner flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        {expiredTasks.length > 0 && (
+          <div className="mb-8 rounded-2xl border border-rose-100 bg-rose-50 px-5 py-4 shadow-inner flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="text-sm text-midnight-600">
-              ✓ {lastArchive.tasksDone} done · ⏱ avg{" "}
-              {lastArchive.avgTimeAliveMins}
-              m · 🗃 archived
+              🗃 {expiredTasks.length} expired {expiredTasks.length === 1 ? "task" : "tasks"} ready
+              for review
             </div>
             <button
               type="button"
-              onClick={handleRestoreArchive}
-              className="inline-flex items-center justify-center rounded-full bg-midnight-900 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-midnight-800 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-midnight-900"
+              onClick={() => setShowExpiredRestore(true)}
+              className="inline-flex items-center justify-center rounded-full bg-rose-500 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600"
             >
               Restore
             </button>
@@ -808,7 +851,7 @@ export default function HomePage() {
                 disabled={aiLoading}
                 className="inline-flex items-center justify-center rounded-full bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-600 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {aiLoading ? "Parsing..." : "Parse"}
+                {aiLoading ? "Applying..." : "Apply"}
               </button>
             </div>
             {aiError && <p className="mt-2 text-sm text-rose-500">{aiError}</p>}
@@ -822,14 +865,29 @@ export default function HomePage() {
                     Due {formatDueLabel(aiResult.due)}
                   </span>
                 )}
-                <span
-                  className={`inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-sm font-medium shadow-sm ${
-                    priorityBadge[aiResult.priority].className
-                  }`}
-                >
-                  {priorityBadge[aiResult.priority].icon}
-                  {priorityBadge[aiResult.priority].label}
-                </span>
+                <div className="relative">
+                  <button
+                    type="button"
+                    className={`priority-chip inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-sm font-semibold shadow-sm ${
+                      priorityBadge[aiPriority].className
+                    }`}
+                    aria-haspopup="listbox"
+                    aria-label="Adjust AI priority"
+                  >
+                    {priorityBadge[aiPriority].icon}
+                    {priorityBadge[aiPriority].label}
+                  </button>
+                  <select
+                    value={aiPriority}
+                    onChange={(event) => setAiPriority(event.target.value as TaskPriority)}
+                    className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
+                    aria-label="Priority options"
+                  >
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                  </select>
+                </div>
                 <button
                   type="button"
                   onClick={handleConfirmAiTask}
@@ -943,6 +1001,73 @@ export default function HomePage() {
           )}
         </section>
       </section>
+
+      {showExpiredRestore && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50 px-4">
+          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-rose-400">
+                  Expired archive
+                </p>
+                <h3 className="text-lg font-semibold text-midnight-900">Restore a task</h3>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleClearExpired}
+                  className="rounded-full border border-rose-200 px-3 py-1.5 text-xs font-semibold text-rose-500 transition hover:border-rose-300 hover:text-rose-700"
+                >
+                  Clear all
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowExpiredRestore(false)}
+                  className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-midnight-500 transition hover:border-midnight-200 hover:text-midnight-800"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+            {expiredTasks.length === 0 ? (
+              <p className="mt-6 rounded-xl border border-slate-200 bg-slate-50 px-4 py-6 text-center text-sm text-midnight-500">
+                No expired tasks available.
+              </p>
+            ) : (
+              <ul className="mt-4 flex max-h-72 flex-col gap-3 overflow-y-auto pr-1">
+                {expiredTasks.map((task) => (
+                  <li
+                    key={task.id}
+                    className="rounded-2xl border border-slate-200 px-4 py-3 shadow-sm"
+                  >
+                    <div className="flex flex-col gap-1">
+                      <p className="text-base font-semibold text-midnight-900">{task.title}</p>
+                      <p className="text-xs font-medium text-midnight-500">
+                        expired {timeAgo(task.expiredAt)}
+                      </p>
+                    </div>
+                    <div className="mt-3 flex items-center justify-between gap-3">
+                      <span
+                        className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${priorityBadge[task.priority].className}`}
+                      >
+                        {priorityBadge[task.priority].icon}
+                        {priorityBadge[task.priority].label}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => handleRestoreExpiredTask(task.id)}
+                        className="inline-flex items-center justify-center rounded-full bg-midnight-900 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-midnight-800"
+                      >
+                        Restore
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </div>
+      )}
 
       {completionMessage && (
         <div className="fixed bottom-6 left-1/2 z-40 w-[min(90%,22rem)] -translate-x-1/2 rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-xl">
