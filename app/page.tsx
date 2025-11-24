@@ -1,1094 +1,442 @@
 "use client";
 
 import Link from "next/link";
+import { useCallback, useEffect, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { parseTaskText } from "@/lib/aiClient";
 import { fireConfetti } from "@/lib/confetti";
-import { timeAgo } from "@/lib/timeAgo";
+import type { TaskPriority } from "@/types/ux";
 
-type TaskPriority = "low" | "medium" | "high";
-
-interface ActiveTask {
-  id: string;
+type DemoResult = {
+  status: "success" | "failed";
   title: string;
-  priority: TaskPriority;
-  dueAt: string | null;
-  expiresAt: number;
-  createdAt: string;
-}
-
-interface ExpiredTask extends ActiveTask {
-  expiredAt: string;
-}
-
-interface CompletedTask {
-  id: string;
-  title: string;
-  createdAt: string;
-  completedAt: string;
-  durationMins?: number;
-  priority: TaskPriority;
-  dueAt: string | null;
-}
-
-interface ParsedTask {
-  title: string;
-  due: string | null;
-  priority: TaskPriority;
-  fallback?: boolean;
-}
-
-type RemovalReason = "complete" | "delete" | "expired";
-
-interface RemovalInfo {
-  task: ActiveTask;
-  reason: RemovalReason;
-  timestamp: number;
-  durationMins?: number;
-}
-
-const DEFAULT_HOURS = 24;
-const URGENT_THRESHOLD_MS = 60 * 60 * 1000;
-const MAX_EXPIRED_STORED = 200;
-const REMOVAL_DELAY = 320; // ms
-
-const ACTIVE_TASKS_KEY = "sd:tasks";
-const EXPIRED_TASKS_KEY = "sd:expired";
-
-const PRIORITY_WEIGHT: Record<TaskPriority, number> = {
-  high: 0,
-  medium: 1,
-  low: 2,
 };
 
-function dedupeTasks<T extends { id: string }>(tasks: T[]): T[] {
-  const seen = new Set<string>();
-  const result: T[] = [];
-  for (const task of tasks) {
-    if (seen.has(task.id)) {
-      continue;
-    }
-    seen.add(task.id);
-    result.push(task);
-  }
-  return result;
-}
-
-function getDateKey(date = new Date()): string {
-  return date.toISOString().split("T")[0]!;
-}
-
-function getCompletedKey(dateKey: string) {
-  return `sd:completed:${dateKey}`;
-}
-
-function getExpiredCountKey(dateKey: string) {
-  return `sd:expiredCount:${dateKey}`;
-}
-
-function safeParseJson<T>(value: string | null): T | null {
-  if (!value) {
-    return null;
-  }
-  try {
-    return JSON.parse(value) as T;
-  } catch {
-    return null;
-  }
-}
-
-function formatTimeRemaining(ms: number): string {
-  if (ms <= 0) {
-    return "Expired";
-  }
-
-  const totalSeconds = Math.floor(ms / 1000);
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  const HH = hours.toString().padStart(2, "0");
-  const MM = minutes.toString().padStart(2, "0");
-  const SS = seconds.toString().padStart(2, "0");
-
-  return `${HH}:${MM}:${SS}`;
-}
-
-function formatDueLabel(due: string | null): string | null {
-  if (!due) {
-    return null;
-  }
-  const dueDate = new Date(due);
-  if (Number.isNaN(dueDate.getTime())) {
-    return null;
-  }
-  return new Intl.DateTimeFormat(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  }).format(dueDate);
-}
-
-function buildLocalDueISO(hour: number, minute = 0) {
-  const now = new Date();
-  const due = new Date(now);
-  due.setHours(hour, minute, 0, 0);
-  if (due.getTime() <= now.getTime()) {
-    due.setDate(due.getDate() + 1);
-  }
-  return due.toISOString();
-}
-
-function detectTimeHint(input: string) {
-  const match = input.match(/^(.*\S)?\s+(\d{1,2})(?::(\d{2}))?\s*$/);
-  if (!match) {
-    return null;
-  }
-  const base = (match[1] ?? "").trim();
-  const hour = Number(match[2]);
-  const minute = match[3] ? Number(match[3]) : 0;
-  if (!Number.isFinite(hour) || hour < 0 || hour > 23) {
-    return null;
-  }
-  if (!Number.isFinite(minute) || minute < 0 || minute > 59) {
-    return null;
-  }
-
-  return {
-    text: base.length > 0 ? base : input.trim(),
-    hour,
-    minute,
-    dueISO: buildLocalDueISO(hour, minute),
-  };
-}
-
-function generateId(): string {
-  if (typeof crypto !== "undefined" && crypto.randomUUID) {
-    return crypto.randomUUID();
-  }
-  return Math.random().toString(36).slice(2);
-}
-
-const priorityBadge: Record<TaskPriority, { label: string; className: string; icon?: string }> = {
-  low: { label: "Low", className: "bg-emerald-100 text-emerald-600" },
-  medium: { label: "Medium", className: "bg-sky-100 text-sky-600" },
-  high: { label: "High", className: "bg-rose-100 text-rose-600", icon: "🔥" },
+type DemoTask = {
+  title: string;
+  priority: TaskPriority;
+  reasoning: string;
+  dueLabel?: string | null;
 };
 
-export default function HomePage() {
-  const [tasks, setTasks] = useState<ActiveTask[]>([]);
-  const [expiredTasks, setExpiredTasks] = useState<ExpiredTask[]>([]);
-  const [completedToday, setCompletedToday] = useState<CompletedTask[]>([]);
-  const [expiredCountToday, setExpiredCountToday] = useState(0);
-  const [dateKey, setDateKey] = useState(getDateKey());
-  const [currentTime, setCurrentTime] = useState(Date.now());
-  const [relativeNow, setRelativeNow] = useState(Date.now());
-
-  const [manualTitle, setManualTitle] = useState("");
-  const [manualHours, setManualHours] = useState("");
-  const [manualPriority, setManualPriority] = useState<TaskPriority>("medium");
-
-  const [aiInput, setAiInput] = useState("");
-  const [aiResult, setAiResult] = useState<ParsedTask | null>(null);
-  const [aiLoading, setAiLoading] = useState(false);
-  const [aiError, setAiError] = useState<string | null>(null);
-  const [aiPriority, setAiPriority] = useState<TaskPriority>("medium");
-
-  const [completionMessage, setCompletionMessage] = useState<string | null>(null);
-  const [completionTaskTitle, setCompletionTaskTitle] = useState<string | null>(null);
-  const [showExpiredRestore, setShowExpiredRestore] = useState(false);
-
-  const [hydrated, setHydrated] = useState(false);
-  const [pendingRemoval, setPendingRemoval] = useState<Map<string, RemovalInfo>>(new Map());
-
-  const tasksRef = useRef<ActiveTask[]>([]);
-  const pendingRemovalRef = useRef<Map<string, RemovalInfo>>(new Map());
-  const removalTimersRef = useRef<Map<string, number>>(new Map());
-  const messageTimerRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    if (typeof window === "undefined") {
-      return;
-    }
-
-    try {
-      const storedTasks = safeParseJson<ActiveTask[]>(localStorage.getItem(ACTIVE_TASKS_KEY)) ?? [];
-      const activeTasks = storedTasks.filter(
-        (task) =>
-          typeof task.expiresAt === "number" &&
-          typeof task.createdAt === "string" &&
-          typeof task.title === "string"
-      );
-
-      setTasks(activeTasks);
-      tasksRef.current = activeTasks;
-
-      const storedExpired =
-        safeParseJson<ExpiredTask[]>(localStorage.getItem(EXPIRED_TASKS_KEY)) ?? [];
-      const validExpired = storedExpired
-        .filter((task) => typeof task.expiredAt === "string" && typeof task.title === "string")
-        .sort((a, b) => Date.parse(b.expiredAt) - Date.parse(a.expiredAt));
-      setExpiredTasks(dedupeTasks(validExpired).slice(0, MAX_EXPIRED_STORED));
-
-    } catch (error) {
-      console.error("Failed to load persisted data", error);
-    } finally {
-      setHydrated(true);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!hydrated || typeof window === "undefined") {
-      return;
-    }
-
-    const completedKey = getCompletedKey(dateKey);
-    const expiredCountKey = getExpiredCountKey(dateKey);
-    const completed =
-      safeParseJson<CompletedTask[]>(localStorage.getItem(completedKey)) ?? [];
-    setCompletedToday(
-      completed.filter((task) => typeof task.completedAt === "string" && task.title)
-    );
-
-    const expiredCount = Number(localStorage.getItem(expiredCountKey) ?? "0");
-    setExpiredCountToday(Number.isFinite(expiredCount) ? expiredCount : 0);
-  }, [dateKey, hydrated]);
-
-  useEffect(() => {
-    if (!hydrated || typeof window === "undefined") {
-      return;
-    }
-    localStorage.setItem(ACTIVE_TASKS_KEY, JSON.stringify(tasks));
-    tasksRef.current = tasks;
-  }, [tasks, hydrated]);
-
-  useEffect(() => {
-    if (!hydrated || typeof window === "undefined") {
-      return;
-    }
-    localStorage.setItem(EXPIRED_TASKS_KEY, JSON.stringify(expiredTasks.slice(0, MAX_EXPIRED_STORED)));
-  }, [expiredTasks, hydrated]);
-
-  useEffect(() => {
-    if (!hydrated || typeof window === "undefined") {
-      return;
-    }
-    const completedKey = getCompletedKey(dateKey);
-    localStorage.setItem(completedKey, JSON.stringify(completedToday));
-  }, [completedToday, hydrated, dateKey]);
-
-  useEffect(() => {
-    if (!hydrated || typeof window === "undefined") {
-      return;
-    }
-    const expiredCountKey = getExpiredCountKey(dateKey);
-    localStorage.setItem(expiredCountKey, String(expiredCountToday));
-  }, [expiredCountToday, hydrated, dateKey]);
-
-
-  useEffect(() => {
-    const tick = () => setCurrentTime(Date.now());
-    const id = window.setInterval(tick, 1000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    const updateRelative = () => setRelativeNow(Date.now());
-    const id = window.setInterval(updateRelative, 60 * 1000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  useEffect(() => {
-    const checkDate = () => {
-      const newKey = getDateKey();
-      if (newKey !== dateKey) {
-        setDateKey(newKey);
-      }
-    };
-    const id = window.setInterval(checkDate, 60 * 1000);
-    return () => window.clearInterval(id);
-  }, [dateKey]);
-
-  useEffect(() => {
-    if (expiredTasks.length === 0) {
-      setShowExpiredRestore(false);
-    }
-  }, [expiredTasks.length]);
-
-  const generateCompletionMessage = useCallback(
-    (task: CompletedTask) => {
-      if (typeof window === "undefined") {
-        return;
-      }
-
-      setCompletionTaskTitle(task.title);
-
-      const body = {
-        completed: [
-          {
-            title: task.title,
-            durationMins: task.durationMins,
-          },
-        ],
-        dateISO: new Date().toISOString(),
-      };
-
-      void fetch("/api/ai/completion-message", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      })
-        .then(async (res) => {
-          if (!res.ok) {
-            throw new Error("Request failed");
-          }
-          const data = (await res.json()) as { summary?: string };
-          const text = data.summary?.trim() || `Nice work finishing ${task.title}!`;
-          setCompletionMessage(text);
-        })
-        .catch(() => {
-          setCompletionMessage(`Nice work finishing ${task.title}!`);
-        })
-        .finally(() => {
-          if (messageTimerRef.current) {
-            window.clearTimeout(messageTimerRef.current);
-          }
-          messageTimerRef.current = window.setTimeout(() => {
-            setCompletionMessage(null);
-            setCompletionTaskTitle(null);
-          }, 6000);
-        });
-    },
-    []
-  );
-
-  const finalizeRemoval = useCallback(
-    (taskId: string) => {
-      const info = pendingRemovalRef.current.get(taskId);
-      if (!info) {
-        return;
-      }
-
-      setTasks((prev) => prev.filter((task) => task.id !== taskId));
-
-      if (info.reason === "complete") {
-        const completedTask: CompletedTask = {
-          id: info.task.id,
-          title: info.task.title,
-          createdAt: info.task.createdAt,
-          completedAt: new Date(info.timestamp).toISOString(),
-          durationMins: info.durationMins,
-          priority: info.task.priority,
-          dueAt: info.task.dueAt,
-        };
-
-        setCompletedToday((prev) => {
-          const exists = prev.some((task) => task.id === completedTask.id);
-          if (exists) {
-            return prev;
-          }
-          return [...prev, completedTask];
-        });
-
-        generateCompletionMessage(completedTask);
-      }
-
-      if (info.reason === "expired") {
-        const expiredTask: ExpiredTask = {
-          ...info.task,
-          expiredAt: new Date(info.timestamp).toISOString(),
-        };
-
-        setExpiredTasks((prev) => {
-          const withoutTask = prev.filter((item) => item.id !== expiredTask.id);
-          const next = [expiredTask, ...withoutTask];
-          return next.slice(0, MAX_EXPIRED_STORED);
-        });
-
-        setExpiredCountToday((prev) => prev + 1);
-      }
-
-      pendingRemovalRef.current.delete(taskId);
-      setPendingRemoval(new Map(pendingRemovalRef.current));
-      const timeoutId = removalTimersRef.current.get(taskId);
-      if (timeoutId) {
-        window.clearTimeout(timeoutId);
-        removalTimersRef.current.delete(taskId);
-      }
-    },
-    []
-  );
-
-  const startRemoval = useCallback(
-    (task: ActiveTask, reason: RemovalReason) => {
-      if (pendingRemovalRef.current.has(task.id)) {
-        return;
-      }
-
-      const now = Date.now();
-      const info: RemovalInfo = {
-        task,
-        reason,
-        timestamp: now,
-      };
-
-      if (reason === "complete") {
-        const duration = Math.max(
-          1,
-          Math.round((now - new Date(task.createdAt).getTime()) / 60000)
-        );
-        info.durationMins = duration;
-      }
-
-      pendingRemovalRef.current.set(task.id, info);
-      if (reason === "complete") {
-        void fireConfetti(task.priority);
-      }
-      setPendingRemoval(new Map(pendingRemovalRef.current));
-
-      const timeoutId = window.setTimeout(() => {
-        finalizeRemoval(task.id);
-      }, REMOVAL_DELAY);
-      removalTimersRef.current.set(task.id, timeoutId);
-    },
-    [finalizeRemoval]
-  );
-
-  useEffect(() => {
-    return () => {
-      removalTimersRef.current.forEach((timeoutId) => {
-        window.clearTimeout(timeoutId);
-      });
-      removalTimersRef.current.clear();
-      if (messageTimerRef.current) {
-        window.clearTimeout(messageTimerRef.current);
-      }
-    };
-  }, []);
-
-  const removeTaskImmediately = useCallback(
-    (taskId: string) => {
-      setTasks((prev) => prev.filter((task) => task.id !== taskId));
-      pendingRemovalRef.current.delete(taskId);
-      setPendingRemoval(new Map(pendingRemovalRef.current));
-    },
-    []
-  );
-
-  useEffect(() => {
-    const id = window.setInterval(() => {
-      const now = Date.now();
-      for (const task of tasksRef.current) {
-        if (task.expiresAt <= now && !pendingRemovalRef.current.has(task.id)) {
-          startRemoval(task, "expired");
-        }
-      }
-    }, 1000);
-
-    return () => window.clearInterval(id);
-  }, [startRemoval]);
-
-  const handleManualSubmit = useCallback(
-    (event: React.FormEvent) => {
-      event.preventDefault();
-      const trimmedTitle = manualTitle.trim();
-      if (!trimmedTitle) {
-        return;
-      }
-
-      const customHours = Number(manualHours);
-      const hours =
-        Number.isFinite(customHours) && customHours > 0 ? customHours : DEFAULT_HOURS;
-
-      addTask({
-        title: trimmedTitle,
-        priority: manualPriority,
-        dueAt: null,
-        hours,
-      });
-
-      setManualTitle("");
-      setManualHours("");
-      setManualPriority("medium");
-    },
-    [manualHours, manualPriority, manualTitle]
-  );
-
-  const addTask = useCallback(
-    ({
-      title,
-      priority,
-      dueAt,
-      hours,
-    }: {
-      title: string;
-      priority: TaskPriority;
-      dueAt: string | null;
-      hours?: number;
-    }) => {
-      const now = Date.now();
-      const createdAt = new Date(now).toISOString();
-      let expiresAt = now + (hours ?? DEFAULT_HOURS) * 60 * 60 * 1000;
-
-      if (dueAt) {
-        const dueTimestamp = Date.parse(dueAt);
-        if (!Number.isNaN(dueTimestamp) && dueTimestamp > now) {
-          expiresAt = dueTimestamp;
-        }
-      }
-
-      const newTask: ActiveTask = {
-        id: generateId(),
-        title,
-        priority,
-        dueAt,
-        expiresAt,
-        createdAt,
-      };
-
-      setTasks((prev) => [...prev, newTask]);
-      setAiResult(null);
-      setAiInput("");
-    },
-    []
-  );
-
-  const handleAiSubmit = useCallback(
-    async (event: React.FormEvent) => {
-      event.preventDefault();
-      const trimmed = aiInput.trim();
-      if (!trimmed) {
-        return;
-      }
-
-      const hint = detectTimeHint(trimmed);
-      const textForModel = hint?.text ?? trimmed;
-      const hintData = hint ? { hour: hint.hour, minute: hint.minute } : undefined;
-      const explicitTime =
-        Boolean(hint) ||
-        /\b\d{1,2}:\d{2}\b/.test(textForModel) ||
-        /\b\d{1,2}\s?(?:am|pm)\b/i.test(textForModel);
-
-      setAiLoading(true);
-      setAiError(null);
-      setAiResult(null);
-
-      const controller = new AbortController();
-      const timeoutId = window.setTimeout(() => controller.abort(), 8000);
-
-      try {
-        const response = await fetch("/api/ai/parse-task", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: textForModel,
-            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-            nowISO: new Date().toISOString(),
-            timeHint: hintData,
-          }),
-          signal: controller.signal,
-        });
-
-        if (!response.ok) {
-          throw new Error("Request failed");
-        }
-        window.clearTimeout(timeoutId);
-        const parsed = (await response.json()) as ParsedTask;
-        if (hint?.dueISO) {
-          parsed.due = hint.dueISO;
-        } else if (!explicitTime) {
-          parsed.due = null;
-        }
-        setAiResult(parsed);
-        setAiPriority(parsed.priority);
-      } catch (error) {
-        console.error("AI parse failed", error);
-        if ((error as Error).name === "AbortError") {
-          const fallback: ParsedTask = {
-            title: textForModel.slice(0, 80) || "Untitled Task",
-            due: hint?.dueISO ?? null,
-            priority: "medium",
-          };
-          setAiResult(fallback);
-          setAiPriority("medium");
-          setAiError("Connection was slow, applied a quick parse.");
-        } else {
-          setAiError("Could not parse task. Try again or add manually.");
-        }
-      } finally {
-        window.clearTimeout(timeoutId);
-        setAiLoading(false);
-      }
-    },
-    [aiInput]
-  );
-
-  const handleConfirmAiTask = useCallback(() => {
-    if (!aiResult) {
-      return;
-    }
-
-    addTask({
-      title: aiResult.title,
-      priority: aiPriority,
-      dueAt: aiResult.due,
-    });
-  }, [addTask, aiPriority, aiResult]);
-
-  const visibleTasks = useMemo(
-    () => tasks.filter((task) => !pendingRemovalRef.current.has(task.id)),
-    [tasks, pendingRemoval]
-  );
-
-  const sortedTasks = useMemo(
-    () =>
-      [...visibleTasks].sort((a, b) => {
-        const priorityDiff = PRIORITY_WEIGHT[a.priority] - PRIORITY_WEIGHT[b.priority];
-        if (priorityDiff !== 0) {
-          return priorityDiff;
-        }
-        return a.expiresAt - b.expiresAt;
-      }),
-    [visibleTasks]
-  );
-
-  const handleCompleteTask = useCallback(
-    (taskId: string) => {
-      const task = tasksRef.current.find((item) => item.id === taskId);
-      if (!task) {
-        return;
-      }
-      startRemoval(task, "complete");
-    },
-    [startRemoval]
-  );
-
-  const handleDeleteTask = useCallback(
-    (taskId: string) => {
-      const task = tasksRef.current.find((item) => item.id === taskId);
-      if (!task) {
-        removeTaskImmediately(taskId);
-        return;
-      }
-      startRemoval(task, "delete");
-    },
-    [removeTaskImmediately, startRemoval]
-  );
-
-  const handleRestoreExpiredTask = useCallback(
-    (taskId: string) => {
-      setExpiredTasks((prev) => {
-        const task = prev.find((item) => item.id === taskId);
-        if (!task) {
-          return prev;
-        }
-        addTask({
-          title: task.title,
-          priority: task.priority,
-          dueAt: null,
-        });
-        return prev.filter((item) => item.id !== taskId);
-      });
-    },
-    [addTask]
-  );
-
-  const handleClearExpired = useCallback(() => {
-    setExpiredTasks([]);
-    setShowExpiredRestore(false);
-    if (typeof window !== "undefined") {
-      localStorage.removeItem(EXPIRED_TASKS_KEY);
-    }
-  }, []);
-
-  const handleDismissMessage = useCallback(() => {
-    if (messageTimerRef.current) {
-      window.clearTimeout(messageTimerRef.current);
-      messageTimerRef.current = null;
-    }
-    setCompletionMessage(null);
-    setCompletionTaskTitle(null);
-  }, []);
-
+type DemoTaskCardProps = {
+  task: DemoTask;
+  timeLeft: number;
+  totalDuration: number;
+  onComplete: () => void;
+};
+
+const DEMO_DURATION_MS = 5000;
+
+const PRIORITY_STYLES: Record<
+  TaskPriority,
+  { label: string; className: string }
+> = {
+  high: {
+    label: "High",
+    className: "bg-rose-500/10 text-rose-200 ring-1 ring-rose-400/40",
+  },
+  medium: {
+    label: "Medium",
+    className: "bg-cyan-500/10 text-cyan-200 ring-1 ring-cyan-400/40",
+  },
+  low: {
+    label: "Low",
+    className: "bg-emerald-500/10 text-emerald-200 ring-1 ring-emerald-400/40",
+  },
+};
+
+function formatTimeLabel(ms: number) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  const minutes = Math.floor(totalSeconds / 60);
+  return `${minutes}:${seconds}`;
+}
+
+export default function LandingPage() {
   return (
-    <main className="min-h-screen py-14 px-4 sm:px-6 flex items-center justify-center">
-      <section className="w-full max-w-3xl rounded-3xl bg-white/70 backdrop-blur-lg shadow-glow border border-slate-200/60 px-6 py-8 sm:px-10 sm:py-12">
-        <header className="text-center mb-10">
-          <div className="inline-flex items-center gap-2 rounded-full bg-indigo-50 px-4 py-1 text-indigo-600 font-medium text-sm mb-6">
-            Self-Destructing Workflow
-          </div>
-          <h1 className="text-3xl sm:text-4xl font-semibold tracking-tight text-midnight-900">
-            Self-Destructing Tasks
-          </h1>
-          <p className="mt-3 text-base sm:text-lg text-midnight-600">
-            Capture tasks with custom timers. They evaporate automatically once the countdown ends.
-          </p>
-          <div className="mt-6 flex items-center justify-center gap-2 text-sm font-medium">
+    <div className="relative min-h-screen overflow-x-hidden bg-[#050815] text-slate-100">
+      <BackgroundGlows />
+      <div className="relative z-10 flex min-h-screen flex-col">
+        <header className="hidden w-full max-w-6xl flex-wrap items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/5 px-4 py-4 backdrop-blur-md shadow-none sm:mx-auto sm:flex sm:px-6 sm:py-5 sm:shadow-[0_5px_20px_rgba(0,0,0,0.25)]">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-gradient-to-br from-cyan-400 to-violet-500 text-base font-bold text-slate-900 shadow-[0_0_15px_rgba(56,189,248,0.3)] sm:h-11 sm:w-11 sm:text-lg sm:shadow-[0_0_25px_rgba(56,189,248,0.4)]">
+                <LandingClockIcon size={36} />
+              </div>
+              <div>
+                <p className="text-base font-semibold text-white sm:text-lg">Taskonate</p>
+              </div>
+            </div>
+          <div className="flex w-full max-w-xs flex-col gap-2 text-sm font-medium sm:w-auto sm:flex-row sm:items-center">
             <Link
-              href="/expired"
-              className="inline-flex items-center gap-2 rounded-full bg-white/80 px-4 py-2 text-midnight-700 shadow-sm ring-1 ring-slate-200 transition hover:text-indigo-600 hover:ring-indigo-200"
+              href="/login"
+              className="w-full rounded-full border border-white/20 px-4 py-2 text-center text-slate-200 transition hover:bg-white/10 hover:text-white sm:w-auto sm:px-5"
             >
-              View expired archive
-              <span className="inline-flex h-6 min-w-[1.5rem] items-center justify-center rounded-full bg-indigo-500/10 px-2 text-xs font-semibold text-indigo-600">
-                {expiredTasks.length}
-              </span>
+              Login
+            </Link>
+            <Link
+              href="/signup"
+              className="w-full rounded-full bg-gradient-to-r from-cyan-400 to-violet-500 px-5 py-2 text-center font-semibold text-slate-950 shadow-[0_6px_20px_rgba(56,189,248,0.25)] transition hover:opacity-95 sm:w-auto sm:px-6 sm:shadow-[0_10px_30px_rgba(56,189,248,0.3)]"
+            >
+              Sign up
             </Link>
           </div>
         </header>
 
-        {expiredTasks.length > 0 && (
-          <div className="mb-8 rounded-2xl border border-rose-100 bg-rose-50 px-5 py-4 shadow-inner flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-            <div className="text-sm text-midnight-600">
-              🗃 {expiredTasks.length} expired {expiredTasks.length === 1 ? "task" : "tasks"} ready
-              for review
+        <main className="mx-auto flex w-full max-w-6xl flex-1 flex-col items-center px-4 pb-20 sm:px-6">
+          <section className="mt-6 flex w-full flex-col items-center text-center sm:mt-10">
+            <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-2xl border border-white/10 bg-white/5 text-2xl text-white shadow-[0_12px_25px_rgba(0,0,0,0.35)] sm:h-20 sm:w-20 sm:text-3xl sm:shadow-[0_20px_40px_rgba(2,6,23,0.5)]">
+              <LandingClockIcon size={52} />
             </div>
-            <button
-              type="button"
-              onClick={() => setShowExpiredRestore(true)}
-              className="inline-flex items-center justify-center rounded-full bg-rose-500 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-rose-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-600"
+            <h1 className="mt-4 max-w-3xl text-balance text-4xl font-semibold leading-tight tracking-tight text-white sm:text-6xl sm:leading-tight">
+              Beat the clock. Stay ahead of self-destructing tasks.
+            </h1>
+            <p className="hidden max-w-2xl text-balance text-base text-slate-300 sm:mt-4 sm:text-xl sm:block">
+              A refined AI task system that keeps every move intentional—calm when you’re on track, dramatic when you drift.
+            </p>
+            <div className="mt-6 flex flex-col gap-3 text-sm font-semibold sm:mt-8 sm:flex-row sm:hidden">
+              <Link
+                href="/signup"
+                className="rounded-2xl bg-gradient-to-r from-cyan-400 to-violet-500 px-6 py-3 text-slate-900 shadow-[0_10px_25px_rgba(56,189,248,0.25)] transition hover:scale-[1.02] hover:opacity-95"
+              >
+                Create free account
+              </Link>
+              <Link
+                href="/login"
+                className="rounded-2xl border border-white/15 px-6 py-3 text-white transition hover:bg-white/10"
+              >
+                Log in
+              </Link>
+            </div>
+          </section>
+
+          <section className="mt-10 w-full sm:mt-12">
+            <DemoGame />
+          </section>
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function DemoGame() {
+  const [inputValue, setInputValue] = useState("");
+  const [task, setTask] = useState<DemoTask | null>(null);
+  const [status, setStatus] = useState<"idle" | "loading" | "running" | "finished">("idle");
+  const [timeLeft, setTimeLeft] = useState(DEMO_DURATION_MS);
+  const [error, setError] = useState<string | null>(null);
+  const [outcome, setOutcome] = useState<DemoResult | null>(null);
+  const controllerRef = useRef<AbortController | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const activeTitleRef = useRef<string>("");
+
+  useEffect(() => {
+    return () => {
+      controllerRef.current?.abort();
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+  }, []);
+
+  const resetDemo = useCallback(() => {
+    controllerRef.current?.abort();
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    activeTitleRef.current = "";
+    setInputValue("");
+    setTask(null);
+    setStatus("idle");
+    setError(null);
+    setTimeLeft(DEMO_DURATION_MS);
+    setOutcome(null);
+  }, []);
+
+  const startCountdown = useCallback(() => {
+    const start = performance.now();
+    const tick = (now: number) => {
+      const elapsed = now - start;
+      const next = Math.max(DEMO_DURATION_MS - elapsed, 0);
+      setTimeLeft(next);
+      if (next <= 0) {
+        rafRef.current = null;
+        handleFailure();
+        return;
+      }
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  const handleFailure = useCallback(() => {
+    setStatus("finished");
+    setOutcome({ status: "failed", title: activeTitleRef.current || "Your task" });
+    setTask(null);
+  }, []);
+
+  const handleSuccess = useCallback(() => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    setStatus("finished");
+    setOutcome({ status: "success", title: activeTitleRef.current || "Your task" });
+    setTask(null);
+  }, []);
+
+  const handleSubmit = useCallback(async () => {
+    if (!inputValue.trim() || status === "loading" || status === "running") return;
+    setError(null);
+    setStatus("loading");
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    try {
+      const parsed = await parseTaskText(inputValue.trim(), controller.signal);
+      const reasoning = parsed.reasoning || `Auto-scheduled for ${Math.max(5, parsed.durationMinutes)} min.`;
+      const taskObj: DemoTask = {
+        title: parsed.title,
+        priority: parsed.priority,
+        reasoning,
+        dueLabel: parsed.dueISO
+          ? new Date(parsed.dueISO).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+          : null,
+      };
+      activeTitleRef.current = parsed.title;
+      setTask(taskObj);
+      setTimeLeft(DEMO_DURATION_MS);
+      setStatus("running");
+      startCountdown();
+    } catch (err) {
+      if ((err as DOMException)?.name === "AbortError") return;
+      setError("Our AI is busy. Try again in a second.");
+      setStatus("idle");
+    }
+  }, [inputValue, status, startCountdown]);
+
+  const handleComplete = useCallback(() => {
+    if (status !== "running") return;
+    fireConfetti(window.innerWidth > 768 ? "medium" : "low");
+    handleSuccess();
+  }, [status, handleSuccess]);
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      handleSubmit();
+    }
+  };
+
+  return (
+    <div className="rounded-2xl border border-white/10 bg-[#0b1224]/90 p-4 backdrop-blur-lg shadow-none sm:p-8 sm:rounded-[2rem] sm:shadow-[0_30px_70px_rgba(2,6,23,0.6)]">
+      <div className="mt-2 sm:mt-4">
+        <AnimatePresence mode="wait">
+          {status === "running" && task ? (
+            <motion.div
+              key="task"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.25, ease: "easeInOut" }}
             >
-              Restore
-            </button>
-          </div>
-        )}
-
-        <div className="grid gap-5">
-          <form
-            className="grid gap-6 rounded-2xl bg-white/90 p-6 shadow-inner border border-slate-200/70"
-            onSubmit={handleManualSubmit}
-          >
-            <div className="grid gap-2">
-              <label className="text-sm font-semibold text-midnight-700" htmlFor="taskTitle">
-                Task
-              </label>
-              <input
-                id="taskTitle"
-                type="text"
-                placeholder="Finish proposal draft, walk the dog, plan the getaway..."
-                value={manualTitle}
-                onChange={(event) => setManualTitle(event.target.value)}
-                className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base shadow-sm outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-200"
-              />
-            </div>
-
-            <div className="grid gap-2 sm:grid-cols-2 sm:gap-4">
-              <div className="grid gap-2">
-                <div className="flex items-center justify-between">
-                  <label className="text-sm font-semibold text-midnight-700" htmlFor="timeLimit">
-                    Time limit (hours)
-                  </label>
-                  <span className="text-xs font-medium text-midnight-400">
-                    Defaults to 24h if blank
-                  </span>
-                </div>
-                <input
-                  id="timeLimit"
-                  type="number"
-                  min="1"
-                  inputMode="numeric"
-                  placeholder="24"
-                  value={manualHours}
-                  onChange={(event) => setManualHours(event.target.value)}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base shadow-sm outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-200"
+              <DemoTaskCard task={task} timeLeft={timeLeft} totalDuration={DEMO_DURATION_MS} onComplete={handleComplete} />
+              <p className="mt-3 text-xs text-slate-400 sm:text-xs">Complete it before the timer implodes.</p>
+            </motion.div>
+          ) : status === "finished" ? (
+            <motion.div
+              key="finished"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.25, ease: "easeInOut" }}
+              className="rounded-2xl border border-white/10 bg-[#0e142a]/90 p-5 text-center backdrop-blur-lg sm:p-8 sm:rounded-3xl sm:shadow-[0_20px_50px_rgba(0,0,0,0.45)]"
+            >
+              <h3 className="mt-2 text-2xl font-bold text-white tracking-tight sm:text-3xl">
+                {outcome?.status === "success" ? "You beat the clock" : "It self-destructed"}
+              </h3>
+              <p className="mt-2 text-sm text-slate-300 sm:mt-3 sm:text-base">
+                {outcome?.status === "success"
+                  ? "That dopamine hit is waiting in the real app."
+                  : "No worries—reset and see how fast you can be."}
+              </p>
+              <div className="mt-5 flex flex-col gap-3 text-sm font-semibold sm:mt-6 sm:flex-row">
+                <Link
+                  href="/signup"
+                  className="w-full rounded-xl bg-gradient-to-r from-cyan-400 to-violet-500 px-4 py-3 text-slate-900 transition shadow-[0_8px_20px_rgba(56,189,248,0.3)] sm:rounded-2xl sm:px-4 sm:shadow-[0_12px_30px_rgba(56,189,248,0.35)]"
+                  aria-label="Go to sign up"
+                >
+                  Sign up
+                </Link>
+                <Link
+                  href="/login"
+                  className="w-full rounded-xl border border-white/20 px-4 py-3 text-white transition hover:bg-white/10 sm:rounded-2xl"
+                  aria-label="Go to login"
+                >
+                  Log in
+                </Link>
+              </div>
+              <button
+                type="button"
+                onClick={resetDemo}
+                className="mt-4 text-sm font-semibold text-cyan-300 transition hover:text-white"
+                aria-label="Try the demo again"
+              >
+                Try the demo again
+              </button>
+            </motion.div>
+          ) : (
+            <motion.div
+              key="input"
+              initial={{ opacity: 0, y: 6 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -6 }}
+              transition={{ duration: 0.25, ease: "easeInOut" }}
+            >
+              <h2 className="mt-2 text-xl font-semibold text-white sm:text-2xl">Type anything you need to do</h2>
+              <p className="mt-1 text-xs text-slate-300 sm:text-sm">Press Enter to submit. We’ll handle the countdown.</p>
+              <div className="mt-5 rounded-2xl border border-cyan-400/60 bg-[#060c1d] px-3 py-2 shadow-[0_12px_35px_rgba(8,15,35,0.65)] ring-1 ring-cyan-400/30 transition sm:rounded-3xl sm:px-4 sm:py-3">
+                <textarea
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  disabled={status === "loading"}
+                  placeholder="Example: Mail John Doe"
+                  className="h-24 w-full resize-none bg-transparent text-base text-white placeholder:text-slate-500/70 focus:outline-none sm:h-32 sm:text-lg"
+                  aria-label="Describe a task for the AI demo"
                 />
               </div>
-
-              <div className="grid gap-2">
-                <label className="text-sm font-semibold text-midnight-700" htmlFor="priority">
-                  Priority
-                </label>
-                <select
-                  id="priority"
-                  value={manualPriority}
-                  onChange={(event) => setManualPriority(event.target.value as TaskPriority)}
-                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-base shadow-sm outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-200"
-                >
-                  <option value="low">Low</option>
-                  <option value="medium">Medium</option>
-                  <option value="high">High</option>
-                </select>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              className="inline-flex items-center gap-2 justify-center rounded-full bg-gradient-to-r from-indigo-500 to-violet-500 px-6 py-3 text-base font-semibold text-white shadow-lg shadow-indigo-200 transition hover:scale-[1.01] hover:shadow-xl focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500 active:scale-95"
-            >
-              Add Task
-            </button>
-          </form>
-
-          <form
-            className="rounded-2xl border border-dashed border-indigo-200 bg-indigo-50/60 p-5 shadow-sm"
-            onSubmit={handleAiSubmit}
-          >
-            <div className="flex items-center justify-between gap-3">
-              <h2 className="text-sm font-semibold uppercase tracking-[0.16em] text-indigo-500">
-                Natural-language capture
-              </h2>
-              {aiResult && (
+              <div className="mt-4">
                 <button
                   type="button"
-                  onClick={() => setAiResult(null)}
-                  className="text-xs font-medium text-indigo-600 hover:underline"
+                  onClick={handleSubmit}
+                  disabled={status === "loading" || !inputValue.trim()}
+                  className="w-full rounded-2xl bg-gradient-to-r from-cyan-400 to-violet-500 px-4 py-3 text-center text-sm font-semibold text-slate-900 shadow-[0_8px_25px_rgba(56,189,248,0.35)] transition hover:opacity-95 disabled:cursor-not-allowed disabled:opacity-50 sm:w-auto sm:px-8"
+                  aria-label="Create demo task"
                 >
-                  Clear
-                </button>
-              )}
-            </div>
-            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center">
-              <input
-                type="text"
-                placeholder="Email Anna tomorrow 9am!!"
-                value={aiInput}
-                onChange={(event) => setAiInput(event.target.value)}
-                className="flex-1 rounded-xl border border-indigo-200 bg-white px-4 py-3 text-base shadow-sm outline-none transition focus:border-indigo-400 focus:ring-4 focus:ring-indigo-200"
-              />
-              <button
-                type="submit"
-                disabled={aiLoading}
-                className="inline-flex items-center justify-center rounded-full bg-indigo-500 px-5 py-2.5 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-600 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {aiLoading ? "Applying..." : "Apply"}
-              </button>
-            </div>
-            {aiError && <p className="mt-2 text-sm text-rose-500">{aiError}</p>}
-            {aiResult && (
-              <div className="mt-4 flex flex-wrap items-center gap-3">
-                <span className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-sm font-medium text-midnight-700 shadow-sm">
-                  {aiResult.title}
-                </span>
-                {aiResult.due && (
-                  <span className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-1.5 text-sm font-medium text-indigo-600 shadow-sm">
-                    Due {formatDueLabel(aiResult.due)}
-                  </span>
-                )}
-                <div className="relative">
-                  <button
-                    type="button"
-                    className={`priority-chip inline-flex items-center gap-2 rounded-full px-3 py-1.5 text-sm font-semibold shadow-sm ${
-                      priorityBadge[aiPriority].className
-                    }`}
-                    aria-haspopup="listbox"
-                    aria-label="Adjust AI priority"
-                  >
-                    {priorityBadge[aiPriority].icon}
-                    {priorityBadge[aiPriority].label}
-                  </button>
-                  <select
-                    value={aiPriority}
-                    onChange={(event) => setAiPriority(event.target.value as TaskPriority)}
-                    className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-                    aria-label="Priority options"
-                  >
-                    <option value="low">Low</option>
-                    <option value="medium">Medium</option>
-                    <option value="high">High</option>
-                  </select>
-                </div>
-                <button
-                  type="button"
-                  onClick={handleConfirmAiTask}
-                  className="inline-flex items-center justify-center rounded-full bg-midnight-900 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-midnight-800"
-                >
-                  Add
+                  {status === "loading" ? "Thinking..." : "Create task"}
                 </button>
               </div>
-            )}
-          </form>
-        </div>
-
-        <section className="mt-10">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="text-lg sm:text-xl font-semibold text-midnight-900">Active Tasks</h2>
-            <span className="text-sm font-medium text-midnight-400">
-              {sortedTasks.length} {sortedTasks.length === 1 ? "task" : "tasks"}
-            </span>
-          </div>
-
-          {sortedTasks.length === 0 ? (
-            <p className="rounded-2xl border border-dashed border-indigo-200 bg-indigo-50/60 px-6 py-10 text-center text-midnight-600">
-              No active tasks yet. Add something you’d rather not forget.
-            </p>
-          ) : (
-            <ul className="grid gap-4">
-              <AnimatePresence>
-                {sortedTasks.map((task) => {
-                  const timeLeft = task.expiresAt - currentTime;
-                  const isUrgent = timeLeft <= URGENT_THRESHOLD_MS;
-                  const dueLabel = formatDueLabel(task.dueAt);
-                  const priorityMeta = priorityBadge[task.priority];
-
-                  return (
-                    <motion.li
-                      key={task.id}
-                      layout
-                      initial={{ opacity: 1, scale: 1 }}
-                      exit={{
-                        opacity: 0,
-                        scale: 0.85,
-                        rotate: -4,
-                        transition: { duration: 0.3 },
-                      }}
-                      className={`flex flex-col gap-4 rounded-2xl border px-5 py-4 shadow-sm transition duration-200 sm:flex-row sm:items-center sm:justify-between ${
-                        isUrgent
-                          ? "border-rose-200/70 bg-rose-50/80"
-                          : "border-slate-200 bg-white/80 hover:border-indigo-200"
-                      }`}
-                    >
-                      <div className="flex flex-col gap-2">
-                        <div className="flex items-center gap-3">
-                          <button
-                            type="button"
-                            onClick={() => handleCompleteTask(task.id)}
-                            className="h-6 w-6 rounded-full border-2 border-slate-300 bg-white transition hover:border-indigo-400 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-500"
-                            aria-label={`Mark ${task.title} complete`}
-                            role="checkbox"
-                            aria-checked="false"
-                          />
-                          <div>
-                            <p className="text-base sm:text-lg font-semibold text-midnight-900">
-                              {task.title}
-                            </p>
-                            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs font-medium text-midnight-500">
-                              <span>added {timeAgo(task.createdAt, relativeNow)}</span>
-                              {dueLabel && (
-                                <span className="inline-flex items-center gap-1 rounded-full bg-indigo-500/10 px-2.5 py-1 text-xs font-semibold text-indigo-600">
-                                  Due {dueLabel}
-                                </span>
-                              )}
-                              <span
-                                className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${priorityMeta.className}`}
-                              >
-                                {priorityMeta.icon}
-                                {priorityMeta.label}
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                        <p
-                          className={`text-sm font-medium ${
-                            isUrgent ? "text-rose-600" : "text-midnight-600"
-                          }`}
-                        >
-                          {formatTimeRemaining(timeLeft)} remaining
-                        </p>
-                      </div>
-
-                      <div className="flex items-center gap-3">
-                        <button
-                          type="button"
-                          onClick={() => handleCompleteTask(task.id)}
-                          className="inline-flex items-center justify-center rounded-full border border-transparent bg-midnight-900/90 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-midnight-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-midnight-900 active:scale-95"
-                        >
-                          Complete
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => handleDeleteTask(task.id)}
-                          className="inline-flex items-center justify-center rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-midnight-600 shadow-sm transition hover:border-rose-200 hover:text-rose-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-rose-400 active:scale-95"
-                        >
-                          Delete
-                        </button>
-                      </div>
-                    </motion.li>
-                  );
-                })}
-              </AnimatePresence>
-            </ul>
+              {error && <p className="mt-3 text-sm text-rose-300">{error}</p>}
+            </motion.div>
           )}
-        </section>
-      </section>
+        </AnimatePresence>
+      </div>
+    </div>
+  );
+}
 
-      {showExpiredRestore && (
-        <div className="fixed inset-0 z-40 flex items-center justify-center bg-slate-900/50 px-4">
-          <div className="w-full max-w-lg rounded-2xl bg-white p-6 shadow-2xl">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.2em] text-rose-400">
-                  Expired archive
-                </p>
-                <h3 className="text-lg font-semibold text-midnight-900">Restore a task</h3>
-              </div>
-              <div className="flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={handleClearExpired}
-                  className="rounded-full border border-rose-200 px-3 py-1.5 text-xs font-semibold text-rose-500 transition hover:border-rose-300 hover:text-rose-700"
-                >
-                  Clear all
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setShowExpiredRestore(false)}
-                  className="rounded-full border border-slate-200 px-3 py-1.5 text-xs font-semibold text-midnight-500 transition hover:border-midnight-200 hover:text-midnight-800"
-                >
-                  Close
-                </button>
-              </div>
-            </div>
-            {expiredTasks.length === 0 ? (
-              <p className="mt-6 rounded-xl border border-slate-200 bg-slate-50 px-4 py-6 text-center text-sm text-midnight-500">
-                No expired tasks available.
-              </p>
-            ) : (
-              <ul className="mt-4 flex max-h-72 flex-col gap-3 overflow-y-auto pr-1">
-                {expiredTasks.map((task) => (
-                  <li
-                    key={task.id}
-                    className="rounded-2xl border border-slate-200 px-4 py-3 shadow-sm"
-                  >
-                    <div className="flex flex-col gap-1">
-                      <p className="text-base font-semibold text-midnight-900">{task.title}</p>
-                      <p className="text-xs font-medium text-midnight-500">
-                        expired {timeAgo(task.expiredAt)}
-                      </p>
-                    </div>
-                    <div className="mt-3 flex items-center justify-between gap-3">
-                      <span
-                        className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${priorityBadge[task.priority].className}`}
-                      >
-                        {priorityBadge[task.priority].icon}
-                        {priorityBadge[task.priority].label}
-                      </span>
-                      <button
-                        type="button"
-                        onClick={() => handleRestoreExpiredTask(task.id)}
-                        className="inline-flex items-center justify-center rounded-full bg-midnight-900 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-midnight-800"
-                      >
-                        Restore
-                      </button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-        </div>
-      )}
+function DemoTaskCard({ task, timeLeft, totalDuration, onComplete }: DemoTaskCardProps) {
+  const priority = PRIORITY_STYLES[task.priority];
+  const progress = Math.min(100, Math.max(0, (1 - timeLeft / totalDuration) * 100));
+  const tone = timeLeft < 1500 ? "text-rose-300" : timeLeft < 3000 ? "text-amber-300" : "text-white";
 
-      {completionMessage && (
-        <div className="fixed bottom-6 left-1/2 z-40 w-[min(90%,22rem)] -translate-x-1/2 rounded-2xl border border-slate-200 bg-white px-5 py-4 shadow-xl">
-          <p className="text-xs font-semibold uppercase tracking-[0.2em] text-indigo-400">
-            Task cleared
-          </p>
-          <p className="mt-1 text-sm font-medium text-midnight-800">{completionMessage}</p>
-          {completionTaskTitle && (
-            <p className="mt-1 text-xs text-midnight-500">Task: {completionTaskTitle}</p>
-          )}
-          <div className="mt-3 flex items-center justify-end gap-2">
-            <button
-              type="button"
-              onClick={handleDismissMessage}
-              className="rounded-full bg-midnight-900 px-3 py-1.5 text-xs font-semibold text-white shadow-sm transition hover:bg-midnight-800"
-            >
-              Dismiss
-            </button>
-          </div>
-        </div>
-      )}
-    </main>
+  return (
+    <div className="rounded-xl border border-white/10 bg-[#0e152b]/90 p-5 backdrop-blur-lg shadow-none sm:p-6 sm:rounded-3xl sm:shadow-[0_25px_50px_rgba(0,0,0,0.4)]">
+      <div className="flex items-center justify-between text-[0.7rem] sm:text-xs">
+        <span className="rounded-full bg-white/5 px-3 py-1 text-white/70">AI task</span>
+        <span className={`rounded-full px-3 py-1 text-[0.7rem] font-semibold ${priority.className} sm:text-xs`}>
+          {priority.label}
+        </span>
+      </div>
+      <h3 className="mt-3 text-xl font-semibold text-white sm:mt-4 sm:text-2xl">{task.title}</h3>
+      {task.dueLabel && <p className="mt-1 text-xs text-slate-500 sm:text-xs">Due around {task.dueLabel}</p>}
+      <div className="mt-5 flex items-center justify-between text-xs font-mono text-white/80 sm:text-sm">
+        <span>Vanishing in</span>
+        <motion.span key={Math.ceil(timeLeft / 100)} className={`text-lg sm:text-xl ${tone}`}>
+          {formatTimeLabel(timeLeft)}
+        </motion.span>
+      </div>
+      <div className="mt-3 h-[6px] overflow-hidden rounded-full bg-white/10 sm:h-2">
+        <motion.div
+          style={{ width: `${progress}%` }}
+          transition={{ duration: 0.1, ease: "linear" }}
+          className="h-full rounded-full bg-gradient-to-r from-cyan-400 to-violet-500"
+        />
+      </div>
+      <motion.button
+        onClick={onComplete}
+        whileTap={{ scale: 0.97 }}
+        className="mt-5 w-full rounded-lg bg-gradient-to-r from-emerald-300 to-cyan-300 py-2.5 text-sm font-semibold text-slate-900 shadow-[0_6px_18px_rgba(16,185,129,0.25)] transition hover:scale-[1.02] sm:mt-6 sm:rounded-xl sm:py-3"
+        aria-label="Complete demo task"
+      >
+        Complete
+      </motion.button>
+    </div>
+  );
+}
+
+function BackgroundGlows() {
+  return (
+    <div aria-hidden className="pointer-events-none absolute inset-0 overflow-hidden">
+      <div className="absolute left-[-25%] top-[-20%] h-56 w-56 rounded-full bg-cyan-400/15 blur-[90px] sm:h-[28rem] sm:w-[28rem] sm:blur-[150px]" />
+      <div className="absolute inset-x-1/2 top-[8%] h-64 w-64 -translate-x-1/2 rounded-full bg-violet-500/15 blur-[110px] sm:h-[35rem] sm:w-[35rem] sm:blur-[200px]" />
+      <div className="absolute bottom-[-20%] right-[-20%] h-52 w-52 rounded-full bg-sky-400/15 blur-[100px] sm:h-[26rem] sm:w-[26rem] sm:blur-[170px]" />
+    </div>
+  );
+}
+
+export function LandingClockIcon({ size = 48 }: { size?: number }) {
+  return (
+    <motion.svg
+      width={size}
+      height={size}
+      viewBox="0 0 64 64"
+      fill="none"
+      animate={{
+        rotate: [-3, 3, -3],
+        y: [0, -1.5, 0],
+      }}
+      transition={{ repeat: Infinity, duration: 2, ease: "easeInOut" }}
+    >
+      <defs>
+        <linearGradient id="clockBody" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stopColor="#a5f3fc" />
+          <stop offset="100%" stopColor="#c084fc" />
+        </linearGradient>
+        <radialGradient id="fuseGlow" cx="50%" cy="50%" r="50%">
+          <stop offset="0%" stopColor="#fcd34d" />
+          <stop offset="100%" stopColor="#dc2626" />
+        </radialGradient>
+      </defs>
+      <circle cx="32" cy="36" r="18" fill="url(#clockBody)" stroke="rgba(255,255,255,0.6)" strokeWidth="2" />
+      <circle cx="32" cy="36" r="15" fill="#050815" stroke="rgba(255,255,255,0.25)" strokeWidth="2" />
+      <line x1="32" y1="36" x2="32" y2="23" stroke="#fdf2f8" strokeWidth="2" strokeLinecap="round" />
+      <line x1="32" y1="36" x2="41" y2="42" stroke="#fdf2f8" strokeWidth="2" strokeLinecap="round" />
+      <circle cx="32" cy="36" r="2" fill="#fdf2f8" />
+      <motion.path
+        d="M16 15 Q20 5 30 12"
+        stroke="#94a3b8"
+        strokeWidth="4"
+        strokeLinecap="round"
+        fill="none"
+        animate={{ y: [-0.5, 0.5, -0.5] }}
+        transition={{ repeat: Infinity, duration: 1.6 }}
+      />
+      <motion.path
+        d="M48 15 Q44 5 34 12"
+        stroke="#94a3b8"
+        strokeWidth="4"
+        strokeLinecap="round"
+        fill="none"
+        animate={{ y: [0.5, -0.5, 0.5] }}
+        transition={{ repeat: Infinity, duration: 1.6 }}
+      />
+      <motion.path
+        d="M32 51 C38 55 42 50 46 54 C50 58 54 57 58 60"
+        stroke="#fde68a"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+        strokeDasharray="2 4"
+        fill="none"
+        animate={{ strokeDashoffset: [0, 8] }}
+        transition={{ repeat: Infinity, duration: 1.4, ease: "linear" }}
+      />
+      <motion.circle
+        cx="58"
+        cy="60"
+        r="3.5"
+        fill="url(#fuseGlow)"
+        animate={{ scale: [0.8, 1.3, 0.8], opacity: [0.5, 1, 0.5] }}
+        transition={{ repeat: Infinity, duration: 0.8 }}
+      />
+    </motion.svg>
   );
 }

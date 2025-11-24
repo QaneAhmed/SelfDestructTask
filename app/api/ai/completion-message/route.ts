@@ -1,13 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
 
-type CompletedTask = {
-  title: string;
-  durationMins?: number;
-};
-
-type CompletionRequest = {
-  completed: CompletedTask[];
-  dateISO: string;
+type CompletionBody = {
+  title?: string;
+  priority?: "low" | "medium" | "high";
 };
 
 const MODEL = "gpt-4o-mini";
@@ -22,34 +17,18 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  let body: CompletionRequest;
-
+  let body: CompletionBody;
   try {
     body = await request.json();
   } catch {
     return NextResponse.json({ error: "Invalid JSON body." }, { status: 400 });
   }
 
-  if (!Array.isArray(body.completed) || body.completed.length === 0) {
-    return NextResponse.json({ error: "At least one completed task is required." }, { status: 400 });
+  if (!body.title) {
+    return NextResponse.json({ error: "Title is required." }, { status: 400 });
   }
 
-  const topTask = body.completed[0];
-  if (!topTask?.title) {
-    return NextResponse.json({ error: "Task title is required." }, { status: 400 });
-  }
-
-  const userPrompt = [
-    `Completed tasks:`,
-    ...body.completed.map((task, index) => {
-      const duration =
-        Number.isFinite(task.durationMins) && task.durationMins
-          ? `${task.durationMins} mins`
-          : "duration unknown";
-      return `${index + 1}. ${task.title} (${duration})`;
-    }),
-    `Date: ${body.dateISO}`,
-  ].join("\n");
+  const userPrompt = `Task: ${body.title}\nPriority: ${body.priority ?? "medium"}`;
 
   const payload = {
     model: MODEL,
@@ -57,7 +36,7 @@ export async function POST(request: NextRequest) {
       {
         role: "system",
         content:
-          "Write one encouraging sentence (≤18 words) celebrating the user's task completion. Mention the most important task by name.",
+          "You are a warm, concise accountability coach. When the user completes a task, respond with one sentence (under 20 words) celebrating momentum and reduced stress. Reference the task by name. No emojis, hashtags, or questions.",
       },
       { role: "user", content: userPrompt },
     ],
@@ -80,13 +59,13 @@ export async function POST(request: NextRequest) {
   }
 
   const data = await response.json();
-  const summary: string | undefined = data.choices?.[0]?.message?.content?.trim();
+  const message: string | undefined = data.choices?.[0]?.message?.content?.trim();
 
-  if (!summary) {
+  if (!message) {
     return NextResponse.json({ error: "Empty response from model." }, { status: 500 });
   }
 
-  return NextResponse.json({ summary });
+  return NextResponse.json({ message });
 }
 
 async function safeJson(response: Response) {

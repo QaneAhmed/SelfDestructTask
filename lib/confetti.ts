@@ -7,7 +7,7 @@ async function getConfetti() {
   return confettiPromise;
 }
 
-type ConfettiLevel = "low" | "medium" | "high";
+export type ConfettiLevel = "low" | "medium" | "high";
 
 const LEVEL_CONFIG: Record<ConfettiLevel, { duration: number; baseCount: number; velocity: number }> =
   {
@@ -43,16 +43,16 @@ export async function fireConfetti(level: ConfettiLevel = "medium") {
 
     confetti.default({
       ...defaults,
-      origin: { x: 0.1, y: 0.7 },
+      origin: { x: 0.5, y: 0.95 },
       particleCount: Math.round(particleCount * 0.6),
-      angle: 60,
+      angle: 80,
     });
 
     confetti.default({
       ...defaults,
-      origin: { x: 0.9, y: 0.7 },
+      origin: { x: 0.5, y: 0.95 },
       particleCount: Math.round(particleCount * 0.8),
-      angle: 120,
+      angle: 100,
     });
 
     requestAnimationFrame(frame);
